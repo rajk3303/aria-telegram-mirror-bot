@@ -13,9 +13,10 @@ import driveDownload = require('./drive/drive-tar');
 import details = require('./dl_model/detail');
 import filenameUtils = require('./download_tools/filename-utils');
 import { EventRegex } from './bot_utils/event_regex';
-// import { exec } from 'child_process';
 import checkDiskSpace = require('check-disk-space');
 import gdUtils = require('./drive/gd-utils');
+import { readFile, writeFile } from 'fs-extra';
+import ytdlFn = require('./download_tools/ytdl');
 
 const telegraph = require('telegraph-node')
 const ph = new telegraph();
@@ -24,6 +25,8 @@ const bot = new TelegramBot(constants.TOKEN, { polling: true });
 var websocketOpened = false;
 var statusInterval: NodeJS.Timeout;
 var dlManager = dlm.DlManager.getInstance();
+const Heroku = require('heroku-client')
+const heroku = new Heroku({ token: process.env.HEROKU_API_KEY })
 
 initAria2();
 
@@ -97,23 +100,89 @@ async function checkIfTorrentFile(msg: TelegramBot.Message, match: RegExpExecArr
   return match;
 }
 
-setEventCallback(eventRegex.commandsRegex.disk, eventRegex.commandsRegexNoName.disk, (msg) => {
+setEventCallback(eventRegex.commandsRegex.stats, eventRegex.commandsRegexNoName.stats, async (msg) => {
   if (msgTools.isAuthorized(msg) < 0) {
     msgTools.sendUnauthorizedMessage(bot, msg);
   } else {
-    // exec(`df --output="size,used,avail" -h "${constants.ARIA_DOWNLOAD_LOCATION_ROOT}" | tail -n1`,
-    //   (err, res) => {
-    //     var disk = res.trim().split(/\s+/);
-    //     msgTools.sendMessage(bot, msg, `Total space: ${disk[0]}B\nUsed: ${disk[1]}B\nAvailable: ${disk[2]}B`);
-    //   }
-    // );
-    checkDiskSpace(constants.ARIA_DOWNLOAD_LOCATION_ROOT).then(res => {
-      let used = res.size - res.free;
-      msgTools.sendMessage(bot, msg, `Total space: ${downloadUtils.formatSize(res.size)}\nUsed: ${downloadUtils.formatSize(used)}\nAvailable: ${downloadUtils.formatSize(res.free)}`);
-    }).catch(error => {
-      console.log('checkDiskSpace: ', error.message);
-      msgTools.sendMessage(bot, msg, `Error checking disk space: ${error.message}`);
-    });
+    try {
+      const diskSpace = await checkDiskSpace(constants.ARIA_DOWNLOAD_LOCATION_ROOT);
+      const avgCpuLoad = await downloadUtils.getCPULoadAVG();
+      const botUptime = downloadUtils.getProcessUptime()
+
+      const usedDiskSpace = diskSpace.size - diskSpace.free;
+
+      msgTools.sendMessage(bot, msg, `Total space: ${downloadUtils.formatSize(diskSpace.size)}\nUsed: ${downloadUtils.formatSize(usedDiskSpace)}\nAvailable: ${downloadUtils.formatSize(diskSpace.free)}\nCPU Load: ${avgCpuLoad}\nBot Uptime: ${botUptime}`);
+    } catch (error) {
+      console.log('stats: ', error.message);
+      msgTools.sendMessage(bot, msg, `Error checking stats: ${error.message}`);
+    }
+  }
+});
+
+setEventCallback(eventRegex.commandsRegex.authorize, eventRegex.commandsRegexNoName.authorize, async (msg) => {
+  if (msgTools.isAuthorized(msg) !== 0) {
+    msgTools.sendMessage(bot, msg, `This command is only for SUDO_USERS`);
+  } else {
+    try {
+      let alreadyAuthorizedChats: any = await readFile('./authorizedChats.json', 'utf8').catch(async err => {
+        if (err.code === 'ENOENT') {
+          // create authorizedChats.json
+          await writeFile('./authorizedChats.json', JSON.stringify([]));
+        } else {
+          throw new Error(err);
+        }
+      });
+      if (alreadyAuthorizedChats) {
+        alreadyAuthorizedChats = JSON.parse(alreadyAuthorizedChats);
+      } else {
+        alreadyAuthorizedChats = [];
+      }
+      const allAuthorizedChats: number[] = constants.AUTHORIZED_CHATS.concat(alreadyAuthorizedChats, constants.SUDO_USERS);
+      if (allAuthorizedChats.includes(msg.chat.id)) {
+        msgTools.sendMessage(bot, msg, `Chat already authorized.`);
+      } else {
+        alreadyAuthorizedChats.push(msg.chat.id);
+        await writeFile('./authorizedChats.json', JSON.stringify(alreadyAuthorizedChats)).then(() => {
+          msgTools.sendMessage(bot, msg, `Chat authorized successfully.`, -1);
+        });
+      }
+    } catch (error) {
+      console.log('authorize: ', error.message);
+      msgTools.sendMessage(bot, msg, `Error authorizing: ${error.message}`);
+    }
+  }
+});
+
+setEventCallback(eventRegex.commandsRegex.unauthorize, eventRegex.commandsRegexNoName.unauthorize, async (msg) => {
+  if (msgTools.isAuthorized(msg) !== 0) {
+    msgTools.sendMessage(bot, msg, `This command is only for SUDO_USERS`);
+  } else {
+    try {
+      let alreadyAuthorizedChats: any = await readFile('./authorizedChats.json', 'utf8').catch(err => {
+        if (err.code === 'ENOENT') {
+          return '';
+        } else {
+          throw new Error(err);
+        }
+      });
+      if (alreadyAuthorizedChats) {
+        alreadyAuthorizedChats = JSON.parse(alreadyAuthorizedChats);
+        const index = alreadyAuthorizedChats.indexOf(msg.chat.id);
+        if (index > -1) {
+          alreadyAuthorizedChats.splice(index, 1);
+          await writeFile('./authorizedChats.json', JSON.stringify(alreadyAuthorizedChats)).then(() => {
+            msgTools.sendMessage(bot, msg, `Chat unauthorized successfully.`, -1);
+          });
+        } else {
+          msgTools.sendMessage(bot, msg, `Cannot unauthorize this chat. Please make sure this chat was authorized using /authorize command only.`);
+        }
+      } else {
+        msgTools.sendMessage(bot, msg, `No authorized chats found. Please make use this chat was authorized using /authorize command only.`);
+      }
+    } catch (error) {
+      console.log('unauthorize: ', error.message);
+      msgTools.sendMessage(bot, msg, `Error unauthorizing: ${error.message}`);
+    }
   }
 });
 
@@ -142,6 +211,28 @@ setEventCallback(eventRegex.commandsRegex.unzipMirror, eventRegex.commandsRegexN
     msgTools.sendUnauthorizedMessage(bot, msg);
   } else {
     mirror(msg, match, false, true);
+  }
+});
+
+setEventCallback(eventRegex.commandsRegex.restart, eventRegex.commandsRegexNoName.restart, async (msg, match) => {
+  if (msgTools.isAuthorized(msg) !== 0) {
+    msgTools.sendMessage(bot, msg, `This command is only for SUDO_USERS`);
+  } else {
+    try {
+      if (!process.env.HEROKU_API_KEY) {
+        msgTools.sendMessage(bot, msg, `Can't restart as <code>HEROKU_API_KEY</code> is not provided`);
+      } else {
+        let restartingMsg = await bot.sendMessage(msg.chat.id, `Heroku dyno will be restarted now.`, {
+          reply_to_message_id: msg.message_id,
+          parse_mode: 'HTML'
+        });
+        await writeFile('./restartObj.json', JSON.stringify({ originalMsg: msg, restartingMsg }));
+        const response = await heroku.delete(`/apps/${process.env.HEROKU_APP_NAME}/dynos`);
+      }
+    } catch (error) {
+      console.log("Error while restart: ", error.message);
+      msgTools.sendMessage(bot, msg, error.message, 60000);
+    }
   }
 });
 
@@ -186,7 +277,7 @@ setEventCallback(eventRegex.commandsRegex.list, eventRegex.commandsRegexNoName.l
     driveList.listFiles(match[4], async (err, res) => {
       msgTools.deleteMsg(bot, searchingMsg);
       if (err) {
-        msgTools.sendMessage(bot, msg, 'Failed to fetch the list of files');
+        msgTools.sendMessage(bot, msg, 'Failed to fetch the list of files: ' + err);
       } else {
         if (constants.TELEGRAPH_TOKEN) {
           try {
@@ -245,13 +336,18 @@ setEventCallback(eventRegex.commandsRegex.cancelMirror, eventRegex.commandsRegex
     if (authorizedCode > -1 && authorizedCode < 3) {
       cancelMirror(dlDetails, msg);
     } else if (authorizedCode === 3) {
-      msgTools.isAdmin(bot, msg, (e, res) => {
-        if (res) {
-          cancelMirror(dlDetails, msg);
-        } else {
-          msgTools.sendMessage(bot, msg, 'You do not have permission to do that.');
-        }
-      });
+      if (msg.from.id === dlDetails.tgFromId) {
+        cancelMirror(dlDetails, msg);
+      } else {
+        msgTools.isAdmin(bot, msg, (e, res) => {
+          console.log('Cta admins-->', res);
+          if (res) {
+            cancelMirror(dlDetails, msg);
+          } else {
+            msgTools.sendMessage(bot, msg, 'You do not have permission to do that.');
+          }
+        });
+      }
     } else {
       msgTools.sendUnauthorizedMessage(bot, msg);
     }
@@ -364,6 +460,29 @@ setEventCallback(eventRegex.commandsRegex.count, eventRegex.commandsRegexNoName.
   }
 });
 
+setEventCallback(eventRegex.commandsRegex.ytdl, eventRegex.commandsRegexNoName.ytdl, async (msg, match) => {
+  if (msgTools.isAuthorized(msg) < 0) {
+    msgTools.sendUnauthorizedMessage(bot, msg);
+  } else {
+    ytdl(msg, match);
+  }
+});
+
+async function ytdl(msg: TelegramBot.Message, match: RegExpExecArray) {
+  try {
+    let ytdlMsg = await bot.sendMessage(msg.chat.id, `Downloading: <code>` + match[4] + `</code>`, {
+      reply_to_message_id: msg.message_id,
+      parse_mode: 'HTML'
+    });
+    await ytdlFn.ytdlWrapper(match[4], bot, ytdlMsg, msg).catch(e => {
+      msgTools.deleteMsg(bot, ytdlMsg);
+      msgTools.sendMessage(bot, msg, e.message || e, 10000);
+    });
+  } catch (error) {
+    msgTools.sendMessage(bot, msg, error);
+  }
+}
+
 /**
  * Start a clonning Google Drive files. Make sure that this is triggered by an
  * authorized user, because this function itself does not check for that.
@@ -464,7 +583,13 @@ setEventCallback(eventRegex.commandsRegex.help, eventRegex.commandsRegexNoName.h
     ➖➖➖➖➖➖➖➖➖➖➖➖
     <code>/getfolder</code> or <code>/gf</code> <b>|</b> Send link of drive mirror folder.
     ➖➖➖➖➖➖➖➖➖➖➖➖
-    <code>/disk</code> or <code>/d</code> <b>|</b> Send disk information of the machine.
+    <code>/stats</code> <b>|</b> Send disk information, cpu load of the machine & bot uptime.
+    ➖➖➖➖➖➖➖➖➖➖➖➖
+    <code>/authorize</code> or <code>/a</code> <b>|</b> To authorize a chat, only run by SUDO_USERS.
+    ➖➖➖➖➖➖➖➖➖➖➖➖
+    <code>/unauthorize</code> or <code>/ua</code> <b>|</b> To Unauthorize a chat, only run by SUDO_USERS.
+    ➖➖➖➖➖➖➖➖➖➖➖➖
+    <code>/restart</code> or <code>/r</code> <b>|</b> Restart Heroku dyno, only run by SUDO_USERS.
     ➖➖➖➖➖➖➖➖➖➖➖➖
     <code>/help</code> or <code>/h</code> <b>|</b> You already know what it does.
     ➖➖➖➖➖➖➖➖➖➖➖➖\n<i>Note: All the above command can also be called using dot(.) instead of slash(/). For e.x: <code>.mirror </code>url or <code>.m </code>url</i>
@@ -505,7 +630,7 @@ function sendCancelledMessages(): void {
   });
 }
 
-function cancelMirror(dlDetails: details.DlVars, cancelMsg?: TelegramBot.Message): boolean {
+export function cancelMirror(dlDetails: details.DlVars, cancelMsg?: TelegramBot.Message): boolean {
   if (dlDetails.isUploading || dlDetails.isExtracting) {
     if (cancelMsg) {
       msgTools.sendMessage(bot, cancelMsg, 'Upload in progress. Cannot cancel.');
@@ -623,9 +748,10 @@ function updateAllStatus(): void {
       var staleStatusReply = 'ETELEGRAM: 400 Bad Request: message to edit not found';
 
       if (res.singleStatuses) {
-        res.singleStatuses.forEach(status => {
+        res.singleStatuses.forEach(async status => {
           if (status.dlDetails) {
             handleDisallowedFilename(status.dlDetails, status.filename);
+            await driveList.isDuplicateMirror(status.filename, status.dlDetails).catch(console.log);
           }
         });
       }
@@ -711,9 +837,10 @@ function ariaOnDownloadStart(gid: string, retry: number): void {
     console.log(`${gid}: Started. Dir: ${dlDetails.downloadDir}.`);
     updateAllStatus();
 
-    ariaTools.getStatus(dlDetails, (err, message, filename) => {
+    ariaTools.getStatus(dlDetails, async (err, message, filename) => {
       if (!err) {
         handleDisallowedFilename(dlDetails, filename);
+        await driveList.isDuplicateMirror(filename, dlDetails).catch(console.log);
       }
     });
 
@@ -736,6 +863,8 @@ function ariaOnDownloadStop(gid: string, retry: number): void {
     var message = 'Download stopped.';
     if (dlDetails.isDownloadAllowed === 0) {
       message += ' Blacklisted file name.';
+    } else if (dlDetails.isDuplicateMirror && dlDetails.isDuplicateMirror !== '') {
+      message += ` Duplicate mirror, below matching file(s) found:\n\n${dlDetails.isDuplicateMirror}`;
     }
     cleanupDownload(gid, message);
   } else if (retry <= 8) {
@@ -769,6 +898,14 @@ function ariaOnDownloadComplete(gid: string, retry: number): void {
 
           var filename = filenameUtils.getFileNameFromPath(file, null);
           if (handleDisallowedFilename(dlDetails, filename)) {
+
+            const duplicateMirror = await driveList.isDuplicateMirror(filename, dlDetails).catch(console.log);
+            if (duplicateMirror) {
+              var reason = `Upload failed. Duplicate mirror, below matching file(s) found:\n\n${duplicateMirror}`;
+              console.log(`${gid}: Duplicate mirror. Filename: ${filename}.`);
+              return cleanupDownload(gid, reason);
+            }
+
             let isUnzip = false;
             if (dlDetails.isUnzip) {
               try {
